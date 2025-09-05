@@ -37,6 +37,9 @@
 (define-data-var cultural-funding-pool uint u0)
 (define-data-var privacy-decay-enabled bool true)
 (define-data-var quantum-resistance-level uint u256)
+(define-data-var next-escrow-id uint u1)
+(define-data-var governance-proposal-count uint u0)
+(define-data-var cultural-impact-threshold uint u5000)
 
 ;; Data Maps
 
@@ -150,10 +153,31 @@
     }
 )
 
-;; Network Governance Variables
-(define-data-var next-escrow-id uint u1)
-(define-data-var governance-proposal-count uint u0)
-(define-data-var cultural-impact-threshold uint u5000)
+;; Helper Functions
+
+(define-read-only (get-resonance-balance (address principal))
+    (default-to u0 (get balance (map-get? resonance-balances { address: address })))
+)
+
+(define-read-only (get-expression-balance (address principal))
+    (default-to u0 (get balance (map-get? expression-balances { address: address })))
+)
+
+(define-read-only (get-legacy-balance (address principal))
+    (default-to u0 (get balance (map-get? legacy-balances { address: address })))
+)
+
+(define-private (transfer-resonance (sender principal) (recipient principal) (amount uint))
+    (let (
+        (sender-balance (get-resonance-balance sender))
+        (recipient-balance (get-resonance-balance recipient))
+    )
+        (asserts! (>= sender-balance amount) ERR-INSUFFICIENT-BALANCE)
+        (map-set resonance-balances { address: sender } { balance: (- sender-balance amount) })
+        (map-set resonance-balances { address: recipient } { balance: (+ recipient-balance amount) })
+        (ok true)
+    )
+)
 
 ;; Owner/Admin Functions
 
@@ -180,6 +204,15 @@
         (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
         (var-set privacy-decay-enabled (not (var-get privacy-decay-enabled)))
         (ok (var-get privacy-decay-enabled))
+    )
+)
+
+(define-public (set-cultural-impact-threshold (new-threshold uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-NOT-AUTHORIZED)
+        (asserts! (> new-threshold u0) ERR-INVALID-AMOUNT)
+        (var-set cultural-impact-threshold new-threshold)
+        (ok true)
     )
 )
 
@@ -284,7 +317,7 @@
             }
         )
         (var-set next-escrow-id (+ escrow-id u1))
-        (transfer-resonance tx-sender (as-contract tx-sender) amount)
+        (try! (transfer-resonance tx-sender (as-contract tx-sender) amount))
         (ok escrow-id)
     )
 )
@@ -297,4 +330,175 @@
     (recursive-proof (buff 128)))
     (let ((existing-impact (map-get? cultural-impacts { impact-id: impact-id })))
         (asserts! (is-none existing-impact) ERR-ALREADY-EXISTS)
-        (asserts! (>= impact-score (var-get cultural
+        (asserts! (>= impact-score (var-get cultural-impact-threshold)) ERR-CULTURAL-IMPACT-UNVERIFIED)
+        (asserts! (> (len verification-proof) u0) ERR-INVALID-PROOF)
+        (map-set cultural-impacts
+            { impact-id: impact-id }
+            {
+                impact-score: impact-score,
+                verification-proof: verification-proof,
+                beneficiary-attestations: beneficiary-attestations,
+                preservation-value: (/ impact-score u10),
+                measurement-height: block-height,
+                recursive-proof: recursive-proof
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (create-reputation-bridge
+    (bridge-id (buff 32))
+    (source-network (buff 32))
+    (target-network (buff 32))
+    (reputation-score uint)
+    (transfer-proof (buff 64)))
+    (let ((existing-bridge (map-get? reputation-bridges { bridge-id: bridge-id })))
+        (asserts! (is-none existing-bridge) ERR-ALREADY-EXISTS)
+        (asserts! (>= reputation-score MIN-REPUTATION-THRESHOLD) ERR-INSUFFICIENT-REPUTATION)
+        (asserts! (> (len transfer-proof) u0) ERR-INVALID-PROOF)
+        (map-set reputation-bridges
+            { bridge-id: bridge-id }
+            {
+                source-network: source-network,
+                target-network: target-network,
+                reputation-score: reputation-score,
+                transfer-proof: transfer-proof,
+                bridge-height: block-height,
+                is-active: true
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (set-collaboration-policy
+    (creator-id (buff 32))
+    (privacy-level uint)
+    (ip-sharing-allowed bool)
+    (cultural-interaction-type uint)
+    (temporal-restrictions uint)
+    (collaboration-bounds uint))
+    (begin
+        (asserts! (and (>= privacy-level u1) (<= privacy-level u5)) ERR-INVALID-AMOUNT)
+        (asserts! (and (>= cultural-interaction-type u1) (<= cultural-interaction-type u10)) ERR-INVALID-AMOUNT)
+        (map-set collaboration-policies
+            { creator-id: creator-id }
+            {
+                privacy-level: privacy-level,
+                ip-sharing-allowed: ip-sharing-allowed,
+                cultural-interaction-type: cultural-interaction-type,
+                temporal-restrictions: temporal-restrictions,
+                collaboration-bounds: collaboration-bounds
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (register-zk-proof
+    (proof-id (buff 32))
+    (proof-type uint)
+    (verification-key (buff 64))
+    (public-inputs (buff 128))
+    (proof-data (buff 256)))
+    (let ((existing-proof (map-get? zk-proof-registry { proof-id: proof-id })))
+        (asserts! (is-none existing-proof) ERR-ALREADY-EXISTS)
+        (asserts! (and (>= proof-type u1) (<= proof-type u10)) ERR-INVALID-AMOUNT)
+        (asserts! (> (len verification-key) u0) ERR-INVALID-PROOF)
+        (map-set zk-proof-registry
+            { proof-id: proof-id }
+            {
+                proof-type: proof-type,
+                verification-key: verification-key,
+                public-inputs: public-inputs,
+                proof-data: proof-data,
+                is-verified: true,
+                creation-height: block-height
+            }
+        )
+        (ok true)
+    )
+)
+
+(define-public (sign-escrow (escrow-id uint))
+    (let (
+        (escrow-data (unwrap! (map-get? cultural-escrows { escrow-id: escrow-id }) ERR-NOT-FOUND))
+        (current-sigs (get current-signatures escrow-data))
+        (required-sigs (get required-signatures escrow-data))
+    )
+        (asserts! (get is-locked escrow-data) ERR-ESCROW-LOCKED)
+        (asserts! (or 
+            (is-eq tx-sender (get funder escrow-data))
+            (is-eq tx-sender (get institution escrow-data))
+            (is-eq tx-sender (get community escrow-data))
+        ) ERR-NOT-AUTHORIZED)
+        (map-set cultural-escrows
+            { escrow-id: escrow-id }
+            (merge escrow-data { current-signatures: (+ current-sigs u1) })
+        )
+        (if (>= (+ current-sigs u1) required-sigs)
+            (begin
+                (try! (transfer-resonance (as-contract tx-sender) (get institution escrow-data) (get amount escrow-data)))
+                (map-set cultural-escrows
+                    { escrow-id: escrow-id }
+                    (merge escrow-data { 
+                        is-locked: false,
+                        release-height: block-height
+                    })
+                )
+                (ok "escrow-released")
+            )
+            (ok "signature-added")
+        )
+    )
+)
+
+;; Read-only Functions
+
+(define-read-only (get-attestation (proof-hash (buff 32)))
+    (map-get? creator-attestations { proof-hash: proof-hash })
+)
+
+(define-read-only (get-institution (institution-id (buff 32)))
+    (map-get? institution-commitments { institution-id: institution-id })
+)
+
+(define-read-only (get-peer-review (review-hash (buff 32)))
+    (map-get? peer-reviews { review-hash: review-hash })
+)
+
+(define-read-only (get-escrow (escrow-id uint))
+    (map-get? cultural-escrows { escrow-id: escrow-id })
+)
+
+(define-read-only (get-cultural-impact (impact-id (buff 32)))
+    (map-get? cultural-impacts { impact-id: impact-id })
+)
+
+(define-read-only (get-reputation-bridge (bridge-id (buff 32)))
+    (map-get? reputation-bridges { bridge-id: bridge-id })
+)
+
+(define-read-only (get-collaboration-policy (creator-id (buff 32)))
+    (map-get? collaboration-policies { creator-id: creator-id })
+)
+
+(define-read-only (get-zk-proof (proof-id (buff 32)))
+    (map-get? zk-proof-registry { proof-id: proof-id })
+)
+
+(define-read-only (get-network-status)
+    {
+        consensus-threshold: (var-get network-consensus-threshold),
+        cultural-funding-pool: (var-get cultural-funding-pool),
+        privacy-decay-enabled: (var-get privacy-decay-enabled),
+        quantum-resistance-level: (var-get quantum-resistance-level),
+        cultural-impact-threshold: (var-get cultural-impact-threshold)
+    }
+)
+
+;; Initialize contract with owner balance
+(map-set resonance-balances { address: CONTRACT-OWNER } { balance: TOTAL-RESONANCE-SUPPLY })
+(map-set expression-balances { address: CONTRACT-OWNER } { balance: TOTAL-EXPRESSION-SUPPLY })
+(map-set legacy-balances { address: CONTRACT-OWNER } { balance: TOTAL-LEGACY-SUPPLY })
